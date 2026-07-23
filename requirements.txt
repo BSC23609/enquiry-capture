@@ -1,0 +1,9 @@
+# Core
+httpx>=0.27
+psycopg[binary]>=3.1
+python-dotenv>=1.0
+
+# Optional — only needed if you run the FastAPI review UI / Excel export
+fastapi>=0.110
+uvicorn>=0.29
+openpyxl>=3.1
