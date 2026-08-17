@@ -7,6 +7,22 @@ You have already done the Azure setup. Three things left.
 
 ---
 
+## Want to know the cost first? (spends nothing)
+
+Before buying any Anthropic credits, you can measure exactly how many mails
+would reach the model — the free prefilter does the counting, no API key needed:
+
+```
+python estimate_cost.py --days 90
+```
+
+It reads your mailbox, runs the free filter over 90 days, and prints how many
+mails would be billable plus the rupee cost that implies. Needs only the three
+Azure secrets and MAILBOX in your .env — not the Anthropic key, not the database.
+Run it, read the number, then buy credits with a real figure in hand.
+
+---
+
 ## 1. Database (5 min)
 
 1. Go to **neon.tech** → your project → create a database named `enquiries`
