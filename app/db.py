@@ -231,11 +231,14 @@ def _log_enrichment(conn, customer_id, field, old, new, graph_id):
 
 
 def find_customer(conn, email, mobile):
-    """Match an inbound mail to a customer: exact email first, then mobile.
+    """Match an inbound mail to a customer.
 
-    Also checks the *_alt arrays, so a customer who once wrote from a second
-    address is still recognised. FOR UPDATE locks the row against concurrent
-    enrichment.
+    Email/mobile are non-unique (companies can share a purchasing agent), so a
+    lookup may hit several rows. We pick deterministically: a primary-field
+    match beats an alt-field match, and among ties the most recently contacted
+    wins. FOR UPDATE locks the chosen row against concurrent enrichment.
+
+    Returns one customer row, or None.
     """
     email = _norm_email(email)
     mobile = _norm_mobile(mobile)
@@ -244,8 +247,12 @@ def find_customer(conn, email, mobile):
         row = conn.execute(
             """SELECT * FROM customers
                 WHERE email = %s OR %s = ANY(email_alt)
+                ORDER BY (email = %s) DESC,           -- primary match first
+                         last_contact_at DESC NULLS LAST,
+                         id
+                LIMIT 1
                 FOR UPDATE""",
-            (email, email),
+            (email, email, email),
         ).fetchone()
         if row:
             return row
@@ -253,8 +260,12 @@ def find_customer(conn, email, mobile):
         row = conn.execute(
             """SELECT * FROM customers
                 WHERE mobile = %s OR %s = ANY(mobile_alt)
+                ORDER BY (mobile = %s) DESC,
+                         last_contact_at DESC NULLS LAST,
+                         id
+                LIMIT 1
                 FOR UPDATE""",
-            (mobile, mobile),
+            (mobile, mobile, mobile),
         ).fetchone()
         if row:
             return row
@@ -296,12 +307,12 @@ def enrich_or_create_customer(conn, fields, graph_id, received_at):
     existing = find_customer(conn, email, mobile)
 
     if existing is None:
+        # No unique constraint on email/mobile now, so this is a plain insert.
         row = conn.execute(
             """INSERT INTO customers
                    (company_name, contact_person, email, mobile, gstin, city,
                     source, sender_type, times_seen, last_contact_at)
                VALUES (%s,%s,%s,%s,%s,%s,'email','customer',1,%s)
-               ON CONFLICT DO NOTHING
                RETURNING id""",
             (company, person, email, mobile, gstin, city, received_at),
         ).fetchone()
@@ -309,10 +320,7 @@ def enrich_or_create_customer(conn, fields, graph_id, received_at):
             _log_enrichment(conn, row["id"], "created", None,
                             company or email or mobile, graph_id)
             return "created", row["id"]
-        # lost a race — fall through and treat as existing
-        existing = find_customer(conn, email, mobile)
-        if existing is None:
-            return "skipped", None
+        return "skipped", None
 
     cid = existing["id"]
     locked = set(existing.get("locked_fields") or [])

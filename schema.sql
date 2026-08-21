@@ -117,9 +117,19 @@ CREATE TABLE IF NOT EXISTS customers (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS customers_email_uq
+-- Migration: earlier versions created UNIQUE indexes on email/mobile. Option A
+-- (one customer per BP Code, shared contacts allowed) requires dropping them.
+-- Harmless if they were never created.
+DROP INDEX IF EXISTS customers_email_uq;
+DROP INDEX IF EXISTS customers_mobile_uq;
+
+-- Email/mobile are NON-unique: multiple companies legitimately share a
+-- purchasing agent's phone or a group email. bp_code is the real identity
+-- (its UNIQUE constraint is on the table definition above). These indexes are
+-- for fast lookup during enrichment, not uniqueness.
+CREATE INDEX IF NOT EXISTS customers_email_idx
     ON customers (email)  WHERE email  IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS customers_mobile_uq
+CREATE INDEX IF NOT EXISTS customers_mobile_idx
     ON customers (mobile) WHERE mobile IS NOT NULL;
 CREATE INDEX IF NOT EXISTS customers_company_idx ON customers (lower(company_name));
 CREATE INDEX IF NOT EXISTS customers_gstin_idx   ON customers (gstin) WHERE gstin IS NOT NULL;

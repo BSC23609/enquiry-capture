@@ -184,7 +184,15 @@ def main() -> None:
             if processed % 250 == 0:
                 print(f"  ...{processed} rows processed "
                       f"({inserted} in, {updated} upd, {skipped} skip)")
+
+        # Explicit commit, then verify on THIS SAME connection before closing.
         conn.commit()
+        check = conn.execute("SELECT count(*) FROM customers").fetchone()[0]
+        print(f"\n[verify] this connection sees {check} rows after commit")
+        if check < inserted:
+            print(f"[verify] WARNING: expected at least {inserted}, saw {check}. "
+                  "Writes are not persisting — likely the DATABASE_URL host is not "
+                  "the one your SQL editor reads, or a pooler is dropping the session.")
 
     print(f"\nSeed complete → inserted {inserted}, updated {updated}, skipped {skipped}")
     with psycopg.connect(DATABASE_URL) as conn:
