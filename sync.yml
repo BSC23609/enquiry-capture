@@ -1,0 +1,61 @@
+name: Sync enquiries
+
+# Every 15 minutes. GitHub's shortest allowed interval is 5, but scheduled
+# runs get queued under load, so anything tighter than ~15 is optimistic.
+# workflow_dispatch gives you a manual "Run workflow" button in the Actions tab.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Days to look back (first run / recovery only)"
+        required: false
+        default: ""
+
+concurrency:
+  # Never let two syncs overlap — the delta cursor is not safe to race.
+  group: enquiry-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
+          MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+          MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
+          MAILBOX: ${{ vars.MAILBOX }}
+          MAILBOX_FOLDER: inbox
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001' }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MAX_MESSAGES_PER_RUN: ${{ vars.MAX_MESSAGES_PER_RUN || '100' }}
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || vars.LOOKBACK_DAYS || '7' }}
+          INTERNAL_DOMAINS: ${{ vars.INTERNAL_DOMAINS }}
+          GRAPH_DRIVE_USER: ${{ vars.GRAPH_DRIVE_USER }}
+          GRAPH_MIRROR_FOLDER: ${{ vars.GRAPH_MIRROR_FOLDER || 'Enquiry Capture' }}
+          MIRROR_ALWAYS: ${{ vars.MIRROR_ALWAYS }}
+        run: python -m app.sync
+
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "::warning::Sync failed. Check the log above."
+          echo "Common causes: expired client secret (they lapse — check the"
+          echo "Azure app registration), Neon cold start timeout, or a"
+          echo "revoked Anthropic key."
