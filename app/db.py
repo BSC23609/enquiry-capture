@@ -201,3 +201,227 @@ def record_message(
             prospect_id, json.dumps(extracted) if extracted else None, llm_used,
         ),
     )
+
+
+# ==================================================================
+# Customer contact book
+# ==================================================================
+
+def _norm_email(v):
+    return (v or "").strip().lower() or None
+
+
+def _norm_mobile(v):
+    import re
+    if not v:
+        return None
+    d = re.sub(r"\D", "", str(v))
+    if len(d) > 10:
+        d = d[-10:]
+    return d if len(d) == 10 and d[0] in "6789" else None
+
+
+def _log_enrichment(conn, customer_id, field, old, new, graph_id):
+    conn.execute(
+        """INSERT INTO customer_enrichment_log
+               (customer_id, field, old_value, new_value, graph_id)
+           VALUES (%s,%s,%s,%s,%s)""",
+        (customer_id, field, old, new, graph_id),
+    )
+
+
+def find_customer(conn, email, mobile):
+    """Match an inbound mail to a customer: exact email first, then mobile.
+
+    Also checks the *_alt arrays, so a customer who once wrote from a second
+    address is still recognised. FOR UPDATE locks the row against concurrent
+    enrichment.
+    """
+    email = _norm_email(email)
+    mobile = _norm_mobile(mobile)
+
+    if email:
+        row = conn.execute(
+            """SELECT * FROM customers
+                WHERE email = %s OR %s = ANY(email_alt)
+                FOR UPDATE""",
+            (email, email),
+        ).fetchone()
+        if row:
+            return row
+    if mobile:
+        row = conn.execute(
+            """SELECT * FROM customers
+                WHERE mobile = %s OR %s = ANY(mobile_alt)
+                FOR UPDATE""",
+            (mobile, mobile),
+        ).fetchone()
+        if row:
+            return row
+    return None
+
+
+def enrich_or_create_customer(conn, fields, graph_id, received_at):
+    """Apply an inbound mail to the customer book.
+
+    sender_type governs the destination:
+      - "customer"  -> enrich an existing row, or auto-create one
+      - anything else -> parked in non_customers, book untouched
+
+    Enrichment fills BLANK primary fields only. A different email/mobile than
+    the one on file is appended to the *_alt array, never overwritten. Every
+    change is written to customer_enrichment_log.
+
+    Returns (action, customer_id|None):
+      action in {"enriched", "created", "noop", "non_customer", "skipped"}
+    """
+    sender_type = fields.get("sender_type") or "other"
+    email = _norm_email(fields.get("email"))
+    mobile = _norm_mobile(fields.get("mobile"))
+    company = (fields.get("company_name") or "").strip() or None
+    person = (fields.get("contact_person") or "").strip() or None
+    gstin = (fields.get("gstin") or "").strip() or None
+    city = (fields.get("city") or "").strip() or None
+
+    if not (email or mobile):
+        return "skipped", None
+
+    # ---- non-customers: keep out of the book ----
+    if sender_type != "customer":
+        _upsert_non_customer(conn, sender_type, company, person, email, mobile,
+                             gstin, fields.get("last_subject"))
+        return "non_customer", None
+
+    # ---- customers ----
+    existing = find_customer(conn, email, mobile)
+
+    if existing is None:
+        row = conn.execute(
+            """INSERT INTO customers
+                   (company_name, contact_person, email, mobile, gstin, city,
+                    source, sender_type, times_seen, last_contact_at)
+               VALUES (%s,%s,%s,%s,%s,%s,'email','customer',1,%s)
+               ON CONFLICT DO NOTHING
+               RETURNING id""",
+            (company, person, email, mobile, gstin, city, received_at),
+        ).fetchone()
+        if row:
+            _log_enrichment(conn, row["id"], "created", None,
+                            company or email or mobile, graph_id)
+            return "created", row["id"]
+        # lost a race — fall through and treat as existing
+        existing = find_customer(conn, email, mobile)
+        if existing is None:
+            return "skipped", None
+
+    cid = existing["id"]
+    locked = set(existing.get("locked_fields") or [])
+    changed = False
+
+    def fill_primary(col, new):
+        nonlocal changed
+        if new and not existing.get(col) and col not in locked:
+            conn.execute(
+                f"UPDATE customers SET {col} = %s, updated_at = now() WHERE id = %s",  # noqa: S608
+                (new, cid),
+            )
+            _log_enrichment(conn, cid, col, None, new, graph_id)
+            changed = True
+
+    fill_primary("company_name", company)
+    fill_primary("contact_person", person)
+    fill_primary("gstin", gstin)
+    fill_primary("city", city)
+    fill_primary("email", email)     # only fills if the row had no email at all
+    fill_primary("mobile", mobile)   # only fills if the row had no mobile at all
+
+    # A different address/number than what's on file -> append to alternates.
+    def add_alt(primary_col, alt_col, value):
+        nonlocal changed
+        if not value:
+            return
+        if value == existing.get(primary_col):
+            return
+        current_alt = existing.get(alt_col) or []
+        if value in current_alt:
+            return
+        # also skip if we just filled the primary with this exact value
+        fresh = conn.execute(
+            f"SELECT {primary_col} FROM customers WHERE id = %s", (cid,)  # noqa: S608
+        ).fetchone()
+        if fresh and fresh[primary_col] == value:
+            return
+        conn.execute(
+            f"UPDATE customers SET {alt_col} = array_append({alt_col}, %s), "  # noqa: S608
+            f"updated_at = now() WHERE id = %s",
+            (value, cid),
+        )
+        _log_enrichment(conn, cid, alt_col, None, value, graph_id)
+        changed = True
+
+    add_alt("email", "email_alt", email)
+    add_alt("mobile", "mobile_alt", mobile)
+
+    conn.execute(
+        "UPDATE customers SET times_seen = times_seen + 1, "
+        "last_contact_at = %s, updated_at = now() WHERE id = %s",
+        (received_at, cid),
+    )
+
+    return ("enriched" if changed else "noop"), cid
+
+
+def _upsert_non_customer(conn, sender_type, company, person, email, mobile,
+                         gstin, subject):
+    email = _norm_email(email)
+    mobile = _norm_mobile(mobile)
+    key_col, key_val = ("email", email) if email else ("mobile", mobile)
+    if not key_val:
+        return
+    # Partial unique indexes (WHERE ... IS NOT NULL) don't work as ON CONFLICT
+    # targets without matching the predicate, so match-then-update explicitly.
+    existing = conn.execute(
+        f"SELECT id FROM non_customers WHERE {key_col} = %s",  # noqa: S608 — fixed pair
+        (key_val,),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """UPDATE non_customers SET
+                   times_seen = times_seen + 1,
+                   last_subject = %s,
+                   sender_type = COALESCE(sender_type, %s),
+                   last_seen = now()
+                WHERE id = %s""",
+            ((subject or "")[:500], sender_type, existing["id"]),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO non_customers
+                   (sender_type, company_name, contact_person, email, mobile,
+                    gstin, last_subject, times_seen)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,1)""",
+            (sender_type, company, person, email, mobile, gstin, (subject or "")[:500]),
+        )
+
+
+def enrichment_summary(conn, days=7):
+    """What the book gained recently — for a weekly glance."""
+    rows = conn.execute(
+        """SELECT field, count(*) AS n
+             FROM customer_enrichment_log
+            WHERE created_at > now() - (%s || ' days')::interval
+            GROUP BY field ORDER BY n DESC""",
+        (days,),
+    ).fetchall()
+    return {r["field"]: r["n"] for r in rows}
+
+
+def fetch_all_customers(conn):
+    """Every customer, for the OneDrive mirror export."""
+    return conn.execute(
+        """SELECT bp_code, company_name, contact_person, email, mobile,
+                  email_alt, mobile_alt, gstin, city, address, zip_code,
+                  source, times_seen, last_contact_at
+             FROM customers
+            ORDER BY company_name NULLS LAST, id"""
+    ).fetchall()

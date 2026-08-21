@@ -47,6 +47,9 @@ jobs:
           MAX_MESSAGES_PER_RUN: ${{ vars.MAX_MESSAGES_PER_RUN || '100' }}
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || vars.LOOKBACK_DAYS || '7' }}
           INTERNAL_DOMAINS: ${{ vars.INTERNAL_DOMAINS }}
+          GRAPH_DRIVE_USER: ${{ vars.GRAPH_DRIVE_USER }}
+          GRAPH_MIRROR_FOLDER: ${{ vars.GRAPH_MIRROR_FOLDER || 'Enquiry Capture' }}
+          MIRROR_ALWAYS: ${{ vars.MIRROR_ALWAYS }}
         run: python -m app.sync
 
       - name: Report failure

@@ -9,6 +9,7 @@ processed twice.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 
@@ -34,13 +35,18 @@ class RunStats:
     inserted: int = 0
     updated: int = 0
     llm_calls: int = 0
+    cust_created: int = 0
+    cust_enriched: int = 0
+    non_customer: int = 0
 
     def summary(self) -> str:
         return (
             f"fetched={self.fetched} new_prospects={self.inserted} "
             f"merged={self.updated} junk={self.junk} no_contact={self.no_contact} "
             f"errors={self.errors} llm_calls={self.llm_calls} "
-            f"already_seen={self.skipped_seen}"
+            f"already_seen={self.skipped_seen} "
+            f"| customers +{self.cust_created} new / {self.cust_enriched} enriched, "
+            f"non_customers={self.non_customer}"
         )
 
 
@@ -104,6 +110,25 @@ def run_once() -> RunStats:
                     if result["llm_used"]:
                         stats.llm_calls += 1
 
+                    # ---- contact book: enrich on ANY mail the model parsed,
+                    # not only enquiries. A known customer's payment confirmation
+                    # still completes their record. ----
+                    if result.get("fields"):
+                        fields_cb = dict(result["fields"])
+                        fields_cb["last_subject"] = subject
+                        cb_action, cust_id = db.enrich_or_create_customer(
+                            conn, fields_cb, graph_id, msg.get("receivedDateTime")
+                        )
+                        if cb_action == "created":
+                            stats.cust_created += 1
+                            log.info("CUST NEW   %s",
+                                     fields_cb.get("company_name")
+                                     or fields_cb.get("email") or "")
+                        elif cb_action == "enriched":
+                            stats.cust_enriched += 1
+                        elif cb_action == "non_customer":
+                            stats.non_customer += 1
+
                     db.record_message(
                         conn,
                         graph_id=graph_id,
@@ -130,6 +155,18 @@ def run_once() -> RunStats:
                 log.info("Delta cursor advanced")
         else:
             log.info("No delta cursor returned — will resume from same point")
+
+        # Mirror the customer book to OneDrive. Non-blocking: a mirror failure
+        # must never fail the sync or roll back captured data.
+        if stats.cust_created or stats.cust_enriched or os.getenv("MIRROR_ALWAYS"):
+            try:
+                from .onedrive_mirror import mirror_to_onedrive
+                with db.connect() as conn:
+                    rows = db.fetch_all_customers(conn)
+                    summary = db.enrichment_summary(conn, days=7)
+                mirror_to_onedrive(rows, summary)
+            except Exception:  # noqa: BLE001
+                log.exception("OneDrive mirror failed (data is safe in Postgres)")
 
     except Exception as exc:  # noqa: BLE001
         log.exception("Sync run failed")

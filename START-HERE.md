@@ -7,6 +7,26 @@ You have already done the Azure setup. Three things left.
 
 ---
 
+
+## Seed the customer book (one-time, before first sync)
+
+You have a customer master (Customer_Contact.xlsx). Load it once so the contact
+book starts complete and the pipeline only ever adds to it:
+
+```
+python tools/seed_customers.py "path\to\Customer_Contact.xlsx"
+```
+
+It prints how many customers loaded and — importantly — how many are missing an
+email or a mobile. Those gaps are exactly what inbound mail fills in over time.
+
+To refresh the allowlist after the customer list grows:
+```
+python tools\build_allowlist.py "path\to\Customer_Contact.xlsx"
+```
+
+---
+
 ## Want to know the cost first? (spends nothing)
 
 Before buying any Anthropic credits, you can measure exactly how many mails

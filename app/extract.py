@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 
 from .config import settings
+from .known_customers import KNOWN_DOMAINS, KNOWN_EMAILS, KNOWN_MOBILES
 
 log = logging.getLogger(__name__)
 
@@ -154,10 +155,43 @@ class Verdict:
     ERROR = "error"
 
 
+def is_known_customer(from_addr: str, body: str) -> str:
+    """Return a non-empty tag if the sender matches the customer master.
+
+    Match order: exact email, then any known mobile appearing in the body,
+    then corporate domain. Free-provider domains (gmail/yahoo) are NEVER
+    domain-matched — only their exact addresses count — because most
+    customers use them and a domain match there would admit the whole world.
+    """
+    addr = (from_addr or "").strip().lower()
+    if addr in KNOWN_EMAILS:
+        return "known email"
+
+    dom = domain_of(addr)
+    if dom and dom in KNOWN_DOMAINS:
+        return "known domain"
+
+    # A known customer mobile in the signature is a strong match even when
+    # they've written from a new address.
+    for m in RE_MOBILE_ANY.finditer(body):
+        n = norm_mobile(m.group(1))
+        if n and n in KNOWN_MOBILES:
+            return "known mobile"
+
+    return ""
+
+
 def prefilter(subject: str, body: str, from_addr: str) -> tuple[bool, str]:
     """Cheap local gate. Returns (worth_sending_to_llm, reason_if_not)."""
     if domain_of(from_addr) in settings.internal_domains:
         return False, "internal sender"
+
+    # Known customers bypass the keyword gate entirely. This is what rescues
+    # the "send pricing for the usual" RFQs that carry intent but no product
+    # word — the case the estimator flagged as ~443 dropped mails.
+    tag = is_known_customer(from_addr, body)
+    if tag:
+        return True, f"allowlisted ({tag})"
 
     hay = f"{subject}\n{body}".lower()
 
@@ -221,6 +255,7 @@ Return ONLY a JSON object. No preamble, no explanation, no markdown fences.
 Schema:
 {
   "is_enquiry": true|false,
+  "sender_type": "customer"|"supplier"|"service_provider"|"marketing"|"other",
   "enquiry_type": "steel"|"roofing"|"peb"|"other"|"",
   "company_name": "",
   "contact_person": "",
@@ -233,6 +268,13 @@ Schema:
 
 Rules:
 - is_enquiry is true ONLY when a human is asking about steel, sheets, coils, roofing, PEB, sheds, structures, fabrication, pricing or a project. It is false for newsletters, marketing, invoices, statements, job applications, automated notifications and vendor cold-outreach.
+- sender_type classifies who the sender is:
+    "customer"         — a buyer asking us to supply, quote, or price steel/roofing/PEB/fabrication; someone placing or chasing an order.
+    "supplier"         — offering to SELL us material, machinery, or raw stock; a vendor's own quotation or catalogue.
+    "service_provider" — banks, logistics/transport, software, consultants, auditors, utilities, telecom.
+    "marketing"        — newsletters, promotional blasts, event invites, cold sales outreach with no specific buying intent toward us.
+    "other"            — anything that fits none of the above, including internal-looking mail and personal messages.
+  A mail can be sender_type "customer" even when is_enquiry is false (e.g. an existing customer sending a payment confirmation). Judge the SENDER, not just this one message.
 - Extract ONLY what is literally present. Never guess, never infer, never complete a partial value. An empty string is always better than a plausible invention.
 - Read the most recent signature block only. Ignore quoted replies, legal disclaimers and footers.
 - company_name: the sender's own company, not ours, and not a company they merely mention. Include the suffix (Pvt Ltd, LLP, Industries) if written.
@@ -298,55 +340,65 @@ def call_claude(subject: str, from_addr: str, from_name: str, body: str) -> dict
 
 # ------------------------------------------------------------------ orchestrate
 def extract(subject: str, from_addr: str, from_name: str, body: str) -> dict[str, Any]:
-    """Returns a dict with verdict, reason, llm_used and the extracted fields."""
+    """Returns verdict, reason, llm_used, sender_type and the extracted fields.
+
+    Fields and sender_type are populated whenever the model ran, even when the
+    mail is not an enquiry — the contact book enriches on any mail from a known
+    customer, not only on enquiries.
+    """
     ok, reason = prefilter(subject, body, from_addr)
     if not ok:
-        return {"verdict": Verdict.JUNK, "reason": reason, "llm_used": False, "fields": {}}
+        return {"verdict": Verdict.JUNK, "reason": reason, "llm_used": False,
+                "sender_type": None, "fields": {}}
 
     try:
         llm = call_claude(subject, from_addr, from_name, body)
     except Exception as exc:              # noqa: BLE001 — we want to record any failure
         log.exception("Extraction failed")
-        return {"verdict": Verdict.ERROR, "reason": str(exc)[:400], "llm_used": True, "fields": {}}
+        return {"verdict": Verdict.ERROR, "reason": str(exc)[:400], "llm_used": True,
+                "sender_type": None, "fields": {}}
 
-    if not llm.get("is_enquiry"):
-        return {"verdict": Verdict.JUNK, "reason": "model: not an enquiry",
-                "llm_used": True, "fields": {}}
-
-    # Regex overrides the model on the three strict-format fields.
+    # Parse fields up front — needed for the contact book regardless of verdict.
     rx = regex_fields(body, from_addr)
-
     gstin = rx["gstin"] or norm_gstin(llm.get("gstin"))
     mobile = rx["mobile"] or norm_mobile(llm.get("mobile"))
     email = norm_email(llm.get("email")) or rx["email"]
-
     company = (llm.get("company_name") or "").strip() or None
     person = (llm.get("contact_person") or "").strip() or None
     city = (llm.get("city") or "").strip() or None
     etype = (llm.get("enquiry_type") or "other").strip().lower() or "other"
 
-    if not any([gstin, mobile, email]):
-        return {"verdict": Verdict.NO_CONTACT,
-                "reason": "enquiry, but no gstin/mobile/email found",
-                "llm_used": True, "fields": {}}
+    sender_type = (llm.get("sender_type") or "other").strip().lower()
+    if sender_type not in ("customer", "supplier", "service_provider", "marketing", "other"):
+        sender_type = "other"
 
     score = (2 if gstin else 0) + (1 if mobile else 0) + \
             (1 if company else 0) + (1 if person else 0)
     confidence = "high" if score >= 4 else ("medium" if score >= 2 else "low")
 
-    return {
-        "verdict": Verdict.ENQUIRY,
-        "reason": "",
-        "llm_used": True,
-        "fields": {
-            "gstin": gstin,
-            "mobile": mobile,
-            "email": email,
-            "company_name": company,
-            "contact_person": person,
-            "city": city,
-            "enquiry_type": etype if etype in ("steel", "roofing", "peb", "other") else "other",
-            "state_code": gstin[:2] if gstin else None,
-            "confidence": confidence,
-        },
+    fields = {
+        "gstin": gstin,
+        "mobile": mobile,
+        "email": email,
+        "company_name": company,
+        "contact_person": person,
+        "city": city,
+        "enquiry_type": etype if etype in ("steel", "roofing", "peb", "other") else "other",
+        "state_code": gstin[:2] if gstin else None,
+        "confidence": confidence,
+        "sender_type": sender_type,
     }
+
+    # Verdict governs the PROSPECTS table only. The contact book acts on
+    # sender_type + fields independently, in the sync layer.
+    if not llm.get("is_enquiry"):
+        return {"verdict": Verdict.JUNK, "reason": "model: not an enquiry",
+                "llm_used": True, "sender_type": sender_type, "fields": fields}
+
+    if not any([gstin, mobile, email]):
+        return {"verdict": Verdict.NO_CONTACT,
+                "reason": "enquiry, but no gstin/mobile/email found",
+                "llm_used": True, "sender_type": sender_type, "fields": fields}
+
+    return {"verdict": Verdict.ENQUIRY, "reason": "", "llm_used": True,
+            "sender_type": sender_type, "fields": fields}

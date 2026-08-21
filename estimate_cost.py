@@ -68,6 +68,7 @@ def main() -> None:
 
     total = len(messages)
     would_reach_model = 0
+    allowlisted = 0
     reasons: Counter[str] = Counter()
     junk_senders: Counter[str] = Counter()
 
@@ -82,6 +83,8 @@ def main() -> None:
         ok, reason = prefilter(subject, body, from_addr)
         if ok:
             would_reach_model += 1
+            if reason.startswith("allowlisted"):
+                allowlisted += 1
         else:
             # Bucket the reason (strip the specific keyword for a clean tally).
             bucket = reason.split(":")[0].strip()
@@ -101,6 +104,8 @@ def main() -> None:
     print(f"  Mails scanned                : {total}")
     print(f"  Filtered for free (no cost)  : {filtered}  ({pct_filtered:.0f}%)")
     print(f"  WOULD reach the model (cost) : {would_reach_model}")
+    print(f"    of which known customers   : {allowlisted}  "
+          f"(rescued by the allowlist)")
     print("=" * 58)
 
     print("\n  Why mail was filtered (free):")
